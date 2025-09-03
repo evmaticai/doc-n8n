@@ -195,7 +195,7 @@ export default function App() {
             <li><b>sessions</b>(id, user_id, created_at, …)</li>
             <li><b>messages</b>(id, session_id, role, content, ts)</li>
             <li><b>tool_calls</b>(id, session_id, tool, args_json, latency_ms, ts)</li>
-            <li><b>lmCache (Redis)</b>: key=hash(prompt+context), value={response, tokens, model, ttl}</li>
+            <li><b>lmCache (Redis)</b>: key=hash(prompt+context), value=&#123;response, tokens, model, ttl&#125;</li>
           </ul>
           <h3>Happy-Path Flow</h3>
           <ol>
