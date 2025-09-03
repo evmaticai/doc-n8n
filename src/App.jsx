@@ -72,6 +72,12 @@ export default function App() {
                 <td>Private/managed. Alternative: Anthropic API / Azure OpenAI / OpenAI.</td>
               </tr>
               <tr>
+                <td>LLM Cache</td>
+                <td>Redis (lmCache) + Smart Keys</td>
+                <td>Cache LLM responses</td>
+                <td>Hash(prompt + context) keys; TTL 24h; 70-90% hit rate expected; significant cost savings.</td>
+              </tr>
+              <tr>
                 <td>Workflow</td>
                 <td>n8n on AWS EC2</td>
                 <td>Webhook + Maestro + tools</td>
@@ -115,7 +121,8 @@ export default function App() {
           <h2 id="architecture-overview">4) Architecture Overview</h2>
           <p>
             Frontend (Next.js) handles sign-up and ATS connection. n8n exposes a Webhook which invokes Maestro.
-            Maestro extracts filters (date, position, location…) and calls the <b>ATS Context API</b> tool.
+            Maestro checks <b>lmCache</b> for similar prompts first; on cache miss, calls <b>AWS Bedrock</b> and caches the response.
+            It extracts filters (date, position, location…) and calls the <b>ATS Context API</b> tool.
             The tool queries <b>Redis</b> first; on a miss, runs a parameterized SQL query against <b>Postgres</b>,
             then sets Redis with TTL+jitter. Every chat session is persisted. The <b>ATS DATA MANAGER</b> sync
             service runs on connect, pre-first-tool-use (debounced), and hourly: it fetches from Unified.to,
@@ -137,7 +144,12 @@ export default function App() {
               <tr>
                 <td>Maestro (LLM)</td>
                 <td>Interprets user intent, builds filters, calls tools, composes final reply.</td>
-                <td>LLM via Bedrock. Keep prompts concise; enforce token guards.</td>
+                <td>LLM via Bedrock + lmCache. Keep prompts concise; enforce token guards.</td>
+              </tr>
+              <tr>
+                <td>lmCache (LLM Cache)</td>
+                <td>Caches LLM responses to reduce API calls and improve latency.</td>
+                <td>Redis-based; hash(prompt+context) keys; 24h TTL; invalidate on model updates.</td>
               </tr>
               <tr>
                 <td>ATS Context API (Tool)</td>
@@ -183,11 +195,13 @@ export default function App() {
             <li><b>sessions</b>(id, user_id, created_at, …)</li>
             <li><b>messages</b>(id, session_id, role, content, ts)</li>
             <li><b>tool_calls</b>(id, session_id, tool, args_json, latency_ms, ts)</li>
+            <li><b>lmCache (Redis)</b>: key=hash(prompt+context), value={response, tokens, model, ttl}</li>
           </ul>
           <h3>Happy-Path Flow</h3>
           <ol>
             <li>Onboarding sync (ATS connect) → Unified.to → ATS DATA MANAGER → upsert Postgres → warm/invalidate Redis.</li>
-            <li>Chat: Webhook → Maestro → build filters → call ATS Context API.</li>
+            <li>Chat: Webhook → Maestro → lmCache lookup → (miss) AWS Bedrock → cache LLM response.</li>
+            <li>Maestro: build filters → call ATS Context API.</li>
             <li>ATS Context API: Redis lookup → (miss) Postgres query (parameterized) → set Redis (TTL+jitter) → return rows.</li>
             <li>Maestro: summarize/rank/compose → respond; Save Session → optional embeddings (Supabase).</li>
           </ol>
@@ -205,9 +219,9 @@ export default function App() {
         <section>
           <h2 id="observability-sre">8) Observability & SRE</h2>
           <ul>
-            <li>Metrics: cache hit/miss, DB latency, token usage, Unified.to error rates.</li>
-            <li>Traces: tool calls (args, latency), SQL timings, sync job steps.</li>
-            <li>Alerts: sync failures, cache stampedes, high p95 latency, token spend spikes.</li>
+            <li>Metrics: ATS cache hit/miss, lmCache hit/miss, DB latency, token usage, Unified.to error rates.</li>
+            <li>Traces: tool calls (args, latency), LLM cache lookups, SQL timings, sync job steps.</li>
+            <li>Alerts: sync failures, cache stampedes, lmCache hit rate drops, high p95 latency, token spend spikes.</li>
           </ul>
         </section>
 
@@ -264,7 +278,8 @@ export default function App() {
           <h3>LLM usage (Bedrock example — Claude-class model)</h3>
           <p className="small">
             Assumptions per conversation: <b>6 turns</b> × (300 input + 150 output tokens) = 1,800 input / 900 output tokens per conversation.<br/>
-            Pricing reference: <b>$0.003 / 1K input</b>, <b>$0.015 / 1K output</b>.
+            Pricing reference: <b>$0.003 / 1K input</b>, <b>$0.015 / 1K output</b>.<br/>
+            <b>lmCache impact:</b> Expected 70-80% cache hit rate reduces actual LLM API calls by ~75%.
           </p>
           <table>
             <thead>
@@ -272,7 +287,8 @@ export default function App() {
                 <th>Conversations / month</th>
                 <th>Input tokens</th>
                 <th>Output tokens</th>
-                <th>LLM Cost / mo</th>
+                <th>Without lmCache</th>
+                <th>With lmCache (75% savings)</th>
               </tr>
             </thead>
             <tbody>
@@ -281,18 +297,21 @@ export default function App() {
                 <td>1,800,000</td>
                 <td>900,000</td>
                 <td><b>$18.90</b></td>
+                <td><b>$4.73</b></td>
               </tr>
               <tr>
                 <td>5,000</td>
                 <td>9,000,000</td>
                 <td>4,500,000</td>
                 <td><b>$94.50</b></td>
+                <td><b>$23.63</b></td>
               </tr>
               <tr>
                 <td>20,000</td>
                 <td>36,000,000</td>
                 <td>18,000,000</td>
                 <td><b>$378.00</b></td>
+                <td><b>$94.50</b></td>
               </tr>
             </tbody>
           </table>
@@ -442,7 +461,8 @@ export default function App() {
               
               <div><b>💬 Chat Request Flow:</b></div>
               <div>Frontend → Webhook Ingestion → Maestro Agent → ATS Context API Tool</div>
-              <div>├─ Maestro ↔ AWS Bedrock (LLM Inference)</div>
+              <div>├─ Maestro → lmCache (check for cached LLM response)</div>
+              <div>├─ Maestro ↔ AWS Bedrock (on cache miss) → lmCache (store response)</div>
               <div>├─ ATS Tool → Redis Cache (L1 lookup)</div>
               <div>├─ ATS Tool → PostgreSQL (fallback query)</div>
               <div>└─ PostgreSQL → Redis (set cache with TTL)</div>
@@ -487,9 +507,21 @@ export default function App() {
                 </tr>
                 <tr>
                   <td>Maestro</td>
+                  <td>lmCache</td>
+                  <td>Check cached LLM response</td>
+                  <td>Cache lookup first</td>
+                </tr>
+                <tr>
+                  <td>Maestro</td>
                   <td>AWS Bedrock</td>
                   <td>LLM prompts</td>
-                  <td>API call</td>
+                  <td>On cache miss</td>
+                </tr>
+                <tr>
+                  <td>AWS Bedrock</td>
+                  <td>lmCache</td>
+                  <td>Store LLM response</td>
+                  <td>Cache write</td>
                 </tr>
                 <tr>
                   <td>ATS Tool</td>
@@ -643,11 +675,18 @@ export default function App() {
                   <td>Cache hit: &lt;50ms, DB query: &lt;500ms</td>
                 </tr>
                 <tr>
-                  <td>Cache Hit Rate</td>
+                  <td>ATS Cache Hit Rate</td>
                   <td>&gt; 80%</td>
                   <td>&gt; 85%</td>
                   <td>N/A</td>
                   <td>Redis hits / total requests</td>
+                </tr>
+                <tr>
+                  <td>LLM Cache Hit Rate (lmCache)</td>
+                  <td>&gt; 70%</td>
+                  <td>&gt; 80%</td>
+                  <td>N/A</td>
+                  <td>Cached LLM responses / total LLM requests</td>
                 </tr>
                 <tr>
                   <td>Sync Job Success</td>
